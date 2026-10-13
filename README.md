@@ -27,10 +27,11 @@ cargo run --bin command-mcp-ui
 ```
 
 The UI starts and owns the local MCP server process. It shows built-in commands
-and configured tools in a scrollable catalog. Saving a change writes
+in groups with quick enable-all and disable-all controls, alongside configured
+tools in a collapsible tree catalog. New configurations keep all predefined
+commands disabled until you explicitly enable them. Saving a change writes
 `.command-mcp.toml` and clearly marks the server as needing a restart; use the
-restart button to apply it. The privileged `kmode_root` command is shown in red
-and remains disabled unless explicitly enabled.
+restart button to apply it.
 
 Connect an MCP client to `http://127.0.0.1:8000/mcp`. If an API key is configured,
 send it as `Authorization: Bearer <key>`.
@@ -152,17 +153,6 @@ directory. Symlinks are resolved before the policy check, and `cat` only reads
 regular files. Common credential locations and filenames are denied unless
 `COMMAND_MCP_ALLOW_SENSITIVE_FILE_READS=true` is explicitly configured.
 
-The optional `kmode_root` tool executes its `command` input as
-`ssh kmode-root <command>`, with a
-120-second timeout and output capped at 200,000 bytes. The command is passed
-to `ssh` as one argument and no local shell is used; the SSH server runs it using
-the remote account's command execution semantics. The MCP service account must
-have a working non-interactive SSH configuration for the `kmode-root` host alias.
-This tool grants MCP callers arbitrary command authority available to that SSH
-identity, so protect the endpoint accordingly. Enable it explicitly in the UI,
-or add `kmode_root` to the `enabled_commands` array in `.command-mcp.toml`.
-Restart the server after changing that file.
-
 ## Configure tools in the UI
 
 Select `+ New` in the configured tools section to create a tool. Each tool has
@@ -181,11 +171,17 @@ Configured tools have four kinds:
 - `Dockerfile command` builds the configured Dockerfile and runs the rendered
   command in the resulting container.
 
-SSH tools use an identity file or the local SSH agent; passwords are not stored
-in the configuration. SCP and SSH destinations are supplied to the OpenSSH
-client as arguments. Docker tools require `docker` in the server process PATH.
-These configurable tools are disabled by default until explicitly enabled in
-the UI.
+SSH tools use the local SSH agent by default; passwords and private key contents
+are never stored in the configuration. You can select an identity file or FIDO2
+key path as a fallback, but a readable unencrypted key file must be treated as
+a credential. For unattended use, load a dedicated restricted key into the
+agent with a short lifetime, for example `ssh-add -t 1h ~/.ssh/command-mcp`.
+The SSH and SCP tools use batch mode, disable agent forwarding and TTY
+allocation, and require the remote host to already exist in `known_hosts`.
+They do not accept new host keys automatically. SCP and SSH destinations are
+supplied to the OpenSSH client as arguments. Docker tools require `docker` in
+the server process PATH. These configurable tools are disabled by default until
+explicitly enabled in the UI.
 
 Docker tools can receive secrets from the environment file without putting
 secret values in the Docker command arguments. Add variables such as

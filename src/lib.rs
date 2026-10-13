@@ -4,9 +4,18 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(test)]
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
 use serde::{Deserialize, Serialize};
 
 pub mod commands;
+
+#[cfg(test)]
+pub(crate) fn test_environment_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct CommandSpec {
@@ -16,252 +25,312 @@ pub struct CommandSpec {
     pub privileged: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct CommandGroup {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub command_names: &'static [&'static str],
+}
+
+pub const COMMAND_GROUPS: &[CommandGroup] = &[
+    CommandGroup {
+        name: "Core",
+        description: "Connectivity and basic process inspection.",
+        command_names: &["health", "echo", "ps"],
+    },
+    CommandGroup {
+        name: "Files and system",
+        description: "Filesystem, journal, kernel, and system information.",
+        command_names: &[
+            "ls",
+            "cat",
+            "journalctl",
+            "uname",
+            "kernel_cmdline",
+            "kernel_modules",
+            "module_info",
+        ],
+    },
+    CommandGroup {
+        name: "Hardware",
+        description: "USB, PCI, USB-C, and Thunderbolt inspection.",
+        command_names: &[
+            "lsusb",
+            "usb_topology",
+            "lspci",
+            "boltctl",
+            "pci_device_state",
+            "typec_state",
+            "thunderbolt_state",
+            "usb_authorization_state",
+        ],
+    },
+    CommandGroup {
+        name: "Display",
+        description: "Display servers, outputs, DRM, and connector state.",
+        command_names: &[
+            "xrandr",
+            "wayland_info",
+            "wlr_randr",
+            "jay_randr",
+            "kscreen_doctor",
+            "gnome_display_state",
+            "drm_info",
+            "modetest",
+            "drm_connector_state",
+        ],
+    },
+    CommandGroup {
+        name: "Drivers and security",
+        description: "Kernel messages, drivers, GPU state, and boot security.",
+        command_names: &[
+            "dmesg",
+            "ubuntu_drivers",
+            "nvidia_smi",
+            "nvidia_modinfo",
+            "nvidia_driver_state",
+            "secure_boot_state",
+            "dkms_status",
+            "nvidia_packages",
+            "prime_select",
+            "supergfx_mode",
+        ],
+    },
+    CommandGroup {
+        name: "Diagnostics",
+        description: "Combined hardware and display diagnosis.",
+        command_names: &["display_diagnostics"],
+    },
+];
+
 pub const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec {
         name: "health",
         description: "Check that the command service is ready.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "echo",
         description: "Echo a bounded message for connectivity testing.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "ls",
         description: "List a file or directory inside configured read roots.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "cat",
         description: "Read one regular file inside configured read roots.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "ps",
         description: "Search running processes by command line.",
-        default_enabled: true,
-        privileged: false,
-    },
-    CommandSpec {
-        name: "aws",
-        description: "Execute an allowlisted read-only AWS command.",
-        default_enabled: true,
-        privileged: false,
-    },
-    CommandSpec {
-        name: "gcloud",
-        description: "Execute an allowlisted read-only gcloud command.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "journalctl",
         description: "Read bounded system journal entries.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "lsusb",
         description: "List USB devices.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "usb_topology",
         description: "Show the USB device tree.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "lspci",
         description: "List PCI devices and drivers.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "dmesg",
         description: "Read kernel messages.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "xrandr",
         description: "Show X11/XWayland display state.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "wayland_info",
         description: "Show Wayland globals and output capabilities.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "wlr_randr",
         description: "Show outputs for wlroots compositors.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "jay_randr",
         description: "Show Jay DRM devices and outputs.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "kscreen_doctor",
         description: "Show KDE Plasma output state.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "gnome_display_state",
         description: "Query GNOME Mutter display state.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "drm_info",
         description: "Show DRM devices and connector properties.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "modetest",
         description: "Show kernel DRM connectors and modes.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "boltctl",
         description: "List USB-C and Thunderbolt devices.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "uname",
         description: "Show kernel and system architecture information.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "kernel_cmdline",
         description: "Show kernel boot parameters.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "kernel_modules",
         description: "List loaded kernel modules.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "module_info",
         description: "Show metadata for one kernel module.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "pci_device_state",
         description: "Show sysfs state for one PCI function.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "typec_state",
         description: "Show Linux USB-C class state.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "thunderbolt_state",
         description: "Show USB4 and Thunderbolt state.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "drm_connector_state",
         description: "Show DRM connectors and EDID presence.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "usb_authorization_state",
         description: "Show USB authorization state.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "ubuntu_drivers",
         description: "List Ubuntu driver recommendations.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "nvidia_smi",
         description: "Show NVIDIA GPU and driver state.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "nvidia_modinfo",
         description: "Show NVIDIA kernel module metadata.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "nvidia_driver_state",
         description: "Show NVIDIA module and runtime state.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "secure_boot_state",
         description: "Show UEFI Secure Boot state.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "dkms_status",
         description: "Show DKMS module status.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "nvidia_packages",
         description: "Show installed NVIDIA packages.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "prime_select",
         description: "Show the selected Ubuntu PRIME mode.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "supergfx_mode",
         description: "Show ASUS supergfxctl GPU mode.",
-        default_enabled: true,
+        default_enabled: false,
         privileged: false,
     },
     CommandSpec {
         name: "display_diagnostics",
         description: "Collect a USB-C monitor and GPU diagnosis snapshot.",
-        default_enabled: true,
-        privileged: false,
-    },
-    CommandSpec {
-        name: "kmode_root",
-        description: "Execute an unrestricted command through kmode-root SSH.",
         default_enabled: false,
-        privileged: true,
+        privileged: false,
     },
 ];
 
@@ -680,6 +749,7 @@ mod tests {
 
     #[test]
     fn missing_api_key_is_generated_and_saved() {
+        let _environment_lock = test_environment_lock();
         let path = env::temp_dir().join(format!(
             "command-mcp-test-{}-api-key.env",
             std::process::id()
@@ -688,6 +758,71 @@ mod tests {
         let key = ensure_env_api_key(&path).expect("generate API key");
         assert_eq!(key.len(), 64);
         assert_eq!(load_env_file(&path).unwrap()["COMMAND_MCP_API_KEY"], key);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn command_groups_cover_each_builtin_once() {
+        let mut grouped = BTreeSet::new();
+        for group in COMMAND_GROUPS {
+            assert!(
+                !group.command_names.is_empty(),
+                "empty group: {}",
+                group.name
+            );
+            for name in group.command_names {
+                assert!(spec(name).is_some(), "unknown command in group: {name}");
+                assert!(
+                    grouped.insert(*name),
+                    "command appears in multiple groups: {name}"
+                );
+            }
+        }
+        assert_eq!(grouped.len(), COMMAND_SPECS.len());
+    }
+
+    #[test]
+    fn server_and_tool_configuration_round_trip() {
+        let path = env::temp_dir().join(format!(
+            "command-mcp-test-{}-config.toml",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        let tool = ConfiguredTool {
+            name: "say_message".into(),
+            enabled: true,
+            command: "echo {message}".into(),
+            parameters: vec![ToolParameter {
+                name: "message".into(),
+                description: "Text to print.".into(),
+                type_name: "string".into(),
+                required: true,
+            }],
+            ..ConfiguredTool::default()
+        };
+        let server = ServerConfig {
+            host: "172.17.0.1".into(),
+            port: 8123,
+            auth_enabled: true,
+            env_file: ".test.env".into(),
+            allow_unauthenticated_remote: false,
+        };
+
+        save_command_config(
+            &path,
+            &BTreeSet::from(["health".into()]),
+            std::slice::from_ref(&tool),
+            &server,
+        )
+        .unwrap();
+        let loaded = load_command_config(&path).unwrap();
+
+        assert_eq!(loaded.server, server);
+        assert_eq!(
+            loaded.enabled_commands,
+            Some(BTreeSet::from(["health".into()]))
+        );
+        assert_eq!(loaded.tools, vec![tool]);
         let _ = fs::remove_file(path);
     }
 }

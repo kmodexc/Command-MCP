@@ -116,12 +116,6 @@ fn default_process_limit() -> u32 {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct CloudArgs {
-    #[schemars(length(min = 1, max = 4096))]
-    pub command: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
 pub struct JournalArgs {
     #[serde(default = "default_journal_lines")]
     pub lines: u32,
@@ -171,12 +165,6 @@ pub struct ModuleArgs {
 pub struct PciArgs {
     #[schemars(length(min = 7, max = 12))]
     pub address: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct KmodeArgs {
-    #[schemars(length(min = 1, max = 16384))]
-    pub command: String,
 }
 
 #[derive(Clone)]
@@ -331,59 +319,6 @@ impl McpServer {
             }
         }
         Ok(Json(result))
-    }
-
-    #[tool(description = "Execute an allowlisted read-only gcloud command without a shell.")]
-    async fn gcloud(
-        &self,
-        Parameters(args): Parameters<CloudArgs>,
-    ) -> Result<Json<CommandResult>, McpError> {
-        Ok(Json(
-            run_cloud_command(
-                &args.command,
-                "gcloud",
-                &[
-                    &["auth", "list"],
-                    &["compute", "instances", "describe"],
-                    &["compute", "instances", "list"],
-                    &["config", "get-value"],
-                    &["projects", "describe"],
-                    &["projects", "list"],
-                ],
-            )
-            .await,
-        ))
-    }
-
-    #[tool(description = "Execute an allowlisted read-only AWS command without a shell.")]
-    async fn aws(
-        &self,
-        Parameters(args): Parameters<CloudArgs>,
-    ) -> Result<Json<CommandResult>, McpError> {
-        Ok(Json(
-            run_cloud_command(
-                &args.command,
-                "aws",
-                &[
-                    &["ec2", "describe-instances"],
-                    &["ec2", "describe-regions"],
-                    &["ec2", "describe-security-groups"],
-                    &["ec2", "describe-subnets"],
-                    &["ec2", "describe-vpcs"],
-                    &["iam", "get-account-summary"],
-                    &["iam", "list-roles"],
-                    &["iam", "list-users"],
-                    &["pricing", "describe-services"],
-                    &["pricing", "get-attribute-values"],
-                    &["pricing", "get-products"],
-                    &["s3api", "get-bucket-location"],
-                    &["s3api", "list-buckets"],
-                    &["s3api", "list-objects-v2"],
-                    &["sts", "get-caller-identity"],
-                ],
-            )
-            .await,
-        ))
     }
 
     #[tool(description = "Read bounded system journal entries using common diagnostic filters.")]
@@ -852,21 +787,6 @@ impl McpServer {
             ),
         })
     }
-
-    #[tool(description = "Execute an unrestricted command through the kmode-root SSH host alias.")]
-    async fn kmode_root(&self, Parameters(args): Parameters<KmodeArgs>) -> Json<CommandResult> {
-        let mut result = run_read_only(
-            vec!["ssh".into(), "kmode-root".into(), args.command],
-            120,
-            None,
-            true,
-        )
-        .await;
-        result.host = "kmode-root".into();
-        result.mode = "execute".into();
-        result.mutating = true;
-        Json(result)
-    }
 }
 
 fn validate_configured_tool(
@@ -1132,9 +1052,7 @@ async fn execute_configured_tool(
             if tool.ssh_port != 0 {
                 argv.extend(["-p".into(), tool.ssh_port.to_string()]);
             }
-            if !tool.ssh_identity_file.trim().is_empty() {
-                argv.extend(["-i".into(), tool.ssh_identity_file.clone()]);
-            }
+            append_ssh_security_options(&mut argv, &tool.ssh_identity_file);
             argv.push(ssh_target(tool));
             let remote_command = render_command(&tool.command, &values)?;
             argv.push(shell_words::join(remote_command));
@@ -1168,9 +1086,7 @@ async fn execute_configured_tool(
             if tool.ssh_port != 0 {
                 argv.extend(["-P".into(), tool.ssh_port.to_string()]);
             }
-            if !tool.ssh_identity_file.trim().is_empty() {
-                argv.extend(["-i".into(), tool.ssh_identity_file.clone()]);
-            }
+            append_ssh_security_options(&mut argv, &tool.ssh_identity_file);
             argv.push(source.display().to_string());
             argv.push(format!("{}:{}", ssh_target(tool), destination));
             let mut result = run_read_only(argv, tool.timeout_seconds, None, true).await;
@@ -1263,6 +1179,29 @@ fn ssh_target(tool: &ConfiguredTool) -> String {
     }
 }
 
+fn append_ssh_security_options(argv: &mut Vec<String>, identity_file: &str) {
+    argv.extend([
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "ForwardAgent=no".into(),
+        "-o".into(),
+        "RequestTTY=no".into(),
+        "-o".into(),
+        "StrictHostKeyChecking=yes".into(),
+    ]);
+    if !identity_file.trim().is_empty() {
+        argv.extend([
+            "-o".into(),
+            "IdentitiesOnly=yes".into(),
+            "-i".into(),
+            identity_file.into(),
+        ]);
+    } else {
+        argv.extend(["-o".into(), "IdentityFile=none".into()]);
+    }
+}
+
 fn docker_image_name(name: &str) -> String {
     let safe = name
         .chars()
@@ -1292,13 +1231,21 @@ pub async fn serve_stdio(settings: Settings) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn serve_http(settings: Settings) -> anyhow::Result<()> {
-    let address = format!("{}:{}", settings.host, settings.port);
+fn build_http_app(settings: Settings) -> anyhow::Result<axum::Router> {
+    let allowed_hosts = [
+        settings.host.clone(),
+        if settings.host.contains(':') {
+            format!("[{}]:{}", settings.host, settings.port)
+        } else {
+            format!("{}:{}", settings.host, settings.port)
+        },
+    ];
     let server = McpServer::new(settings.clone())?;
     let service = StreamableHttpService::new(
         move || Ok(server.clone()),
         LocalSessionManager::default().into(),
         StreamableHttpServerConfig::default()
+            .with_allowed_hosts(allowed_hosts)
             .with_legacy_session_mode(false)
             .with_json_response(true),
     );
@@ -1319,6 +1266,12 @@ pub async fn serve_http(settings: Settings) -> anyhow::Result<()> {
     } else {
         public_routes.merge(mcp_routes)
     };
+    Ok(app)
+}
+
+pub async fn serve_http(settings: Settings) -> anyhow::Result<()> {
+    let address = format!("{}:{}", settings.host, settings.port);
+    let app = build_http_app(settings)?;
     let listener = tokio::net::TcpListener::bind(&address).await?;
     tracing::info!("Command MCP listening on http://{address}/mcp");
     axum::serve(listener, app)
@@ -1606,43 +1559,6 @@ fn redact(mut text: String) -> (String, usize, Vec<String>) {
         }
     }
     (text, count, categories)
-}
-
-async fn run_cloud_command(
-    command_text: &str,
-    executable: &str,
-    allowed: &[&[&str]],
-) -> CommandResult {
-    let Ok(argv) = shell_words::split(command_text) else {
-        return error_result("invalid command: could not parse shell quoting".to_string());
-    };
-    if argv.first().map(String::as_str) != Some(executable) {
-        return error_result(format!("command does not start with {executable}"));
-    }
-    let allowed_command = allowed.iter().any(|prefix| {
-        argv.get(1..)
-            .map(|args| {
-                args.len() >= prefix.len()
-                    && args
-                        .iter()
-                        .zip(*prefix)
-                        .all(|(actual, expected)| actual == expected)
-            })
-            .unwrap_or(false)
-    });
-    if !allowed_command {
-        return error_result(format!(
-            "{executable} command is not in the read-only allowlist"
-        ));
-    }
-    let mut environment: HashMap<String, String> = env::vars().collect();
-    environment.extend([
-        ("AWS_PAGER".into(), "".into()),
-        ("AWS_CLI_AUTO_PROMPT".into(), "off".into()),
-        ("CLOUDSDK_CORE_DISABLE_PROMPTS".into(), "1".into()),
-        ("CLOUDSDK_PAGER".into(), "".into()),
-    ]);
-    run_read_only(argv, 15, Some(environment), true).await
 }
 
 fn error_result(message: String) -> CommandResult {
@@ -1939,6 +1855,175 @@ fn assess_display(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{save_command_config, save_env_file};
+    use axum::{body::Body, http::Request};
+    use serde_json::Value;
+    use std::{ffi::OsString, fs, sync::MutexGuard};
+    use tower::ServiceExt;
+
+    struct TestEnvironment {
+        previous: Vec<(&'static str, Option<OsString>)>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl TestEnvironment {
+        fn new(values: &[(&'static str, &str)]) -> Self {
+            let lock = crate::test_environment_lock();
+            let previous = values
+                .iter()
+                .map(|(key, value)| {
+                    let previous = std::env::var_os(key);
+                    unsafe { std::env::set_var(key, value) };
+                    (*key, previous)
+                })
+                .collect();
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for TestEnvironment {
+        fn drop(&mut self) {
+            for (key, value) in &self.previous {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    fn test_tool(name: &str, enabled: bool, command: &str) -> ConfiguredTool {
+        ConfiguredTool {
+            name: name.into(),
+            description: format!("{name} test tool."),
+            kind: ConfiguredToolKind::Local,
+            enabled,
+            command: command.into(),
+            parameters: vec![crate::ToolParameter {
+                name: "message".into(),
+                description: "Text to print.".into(),
+                type_name: "string".into(),
+                required: true,
+            }],
+            ..ConfiguredTool::default()
+        }
+    }
+
+    fn http_test_settings(host: &str, api_key: Option<&str>) -> crate::Settings {
+        crate::Settings {
+            host: host.into(),
+            port: 8000,
+            api_key: api_key.map(str::to_owned),
+            read_roots: vec![PathBuf::from(".")],
+            allow_unauthenticated_remote: false,
+            allow_sensitive_file_reads: false,
+            config_path: PathBuf::from(".command-mcp.toml"),
+            enabled_commands: BTreeSet::new(),
+            configured_tools: vec![test_tool("say_message", true, "echo {message}")],
+        }
+    }
+
+    fn mcp_request(host: &str, api_key: Option<&str>, id: u64, method: &str) -> Request<Body> {
+        let params = if method == "initialize" {
+            serde_json::json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "component-test", "version": "1"}
+            })
+        } else {
+            serde_json::json!({})
+        };
+        mcp_request_with_params(host, api_key, id, method, params)
+    }
+
+    fn mcp_request_with_params(
+        host: &str,
+        api_key: Option<&str>,
+        id: u64,
+        method: &str,
+        params: Value,
+    ) -> Request<Body> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("host", host)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2025-06-18");
+        if let Some(api_key) = api_key {
+            builder = builder.header("authorization", format!("Bearer {api_key}"));
+        }
+        builder.body(Body::from(body.to_string())).unwrap()
+    }
+
+    async fn json_body(response: axum::response::Response) -> Value {
+        let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn advertised_tool_names(app: &axum::Router) -> Vec<String> {
+        let initialize = app
+            .clone()
+            .oneshot(mcp_request(
+                "172.17.0.1:8000",
+                Some("test-key"),
+                1,
+                "initialize",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(initialize.status(), axum::http::StatusCode::OK);
+
+        let list = app
+            .clone()
+            .oneshot(mcp_request(
+                "172.17.0.1:8000",
+                Some("test-key"),
+                2,
+                "tools/list",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(list.status(), axum::http::StatusCode::OK);
+        let body = json_body(list).await;
+        let mut names = body["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    fn loaded_http_app(path: &std::path::Path) -> axum::Router {
+        let config = crate::load_command_config(path).unwrap();
+        build_http_app(crate::Settings {
+            host: config.server.host.clone(),
+            port: config.server.port,
+            api_key: Some("test-key".into()),
+            read_roots: vec![PathBuf::from(".")],
+            allow_unauthenticated_remote: config.server.allow_unauthenticated_remote,
+            allow_sensitive_file_reads: false,
+            config_path: path.to_path_buf(),
+            enabled_commands: config.enabled_commands.unwrap_or_default(),
+            configured_tools: config.tools,
+        })
+        .unwrap()
+    }
 
     #[test]
     fn redacts_credentials() {
@@ -1951,9 +2036,259 @@ mod tests {
     }
 
     #[test]
-    fn default_commands_leave_privileged_tool_disabled() {
-        assert!(!crate::default_enabled_commands().contains("kmode_root"));
-        assert!(crate::default_enabled_commands().contains("display_diagnostics"));
+    fn predefined_commands_are_disabled_by_default() {
+        assert!(crate::default_enabled_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn http_initialize_and_tools_list_match_exposed_tools() {
+        let app = build_http_app(http_test_settings("172.17.0.1", Some("test-key"))).unwrap();
+
+        let initialize = app
+            .clone()
+            .oneshot(mcp_request(
+                "172.17.0.1:8000",
+                Some("test-key"),
+                1,
+                "initialize",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(initialize.status(), axum::http::StatusCode::OK);
+        let initialize_body = json_body(initialize).await;
+        assert_eq!(initialize_body["result"]["protocolVersion"], "2025-06-18");
+        assert!(initialize_body["result"]["capabilities"]["tools"].is_object());
+
+        let list = app
+            .oneshot(mcp_request(
+                "172.17.0.1:8000",
+                Some("test-key"),
+                2,
+                "tools/list",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(list.status(), axum::http::StatusCode::OK);
+        let list_body = json_body(list).await;
+        let tools = list_body["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "say_message");
+        assert_eq!(tools[0]["inputSchema"]["required"][0], "message");
+    }
+
+    #[tokio::test]
+    async fn http_can_call_a_custom_tool_that_it_advertises() {
+        let app = build_http_app(http_test_settings("172.17.0.1", Some("test-key"))).unwrap();
+        let response = app
+            .oneshot(mcp_request_with_params(
+                "172.17.0.1:8000",
+                Some("test-key"),
+                1,
+                "tools/call",
+                serde_json::json!({
+                    "name": "say_message",
+                    "arguments": {"message": "hello from MCP"}
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["result"]["content"][0]["type"], "text");
+        assert!(
+            body["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("hello from MCP")
+        );
+    }
+
+    #[tokio::test]
+    async fn http_tools_follow_saved_reloaded_and_reconfigured_custom_tools() {
+        let path = std::env::temp_dir().join(format!(
+            "command-mcp-http-tools-{}-{}.toml",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let server = crate::ServerConfig {
+            host: "172.17.0.1".into(),
+            port: 8000,
+            auth_enabled: true,
+            env_file: ".test.env".into(),
+            allow_unauthenticated_remote: false,
+        };
+        let mut tools = vec![test_tool("say_message", true, "echo {message}")];
+
+        save_command_config(&path, &BTreeSet::new(), &tools, &server).unwrap();
+        assert_eq!(
+            advertised_tool_names(&loaded_http_app(&path)).await,
+            vec!["say_message"]
+        );
+
+        tools.push(test_tool("second_tool", false, "echo {message}"));
+        save_command_config(&path, &BTreeSet::new(), &tools, &server).unwrap();
+        assert_eq!(
+            advertised_tool_names(&loaded_http_app(&path)).await,
+            vec!["say_message"]
+        );
+
+        tools[1].enabled = true;
+        save_command_config(&path, &BTreeSet::new(), &tools, &server).unwrap();
+        assert_eq!(
+            advertised_tool_names(&loaded_http_app(&path)).await,
+            vec!["say_message", "second_tool"]
+        );
+
+        tools[0].enabled = false;
+        save_command_config(&path, &BTreeSet::new(), &tools, &server).unwrap();
+        assert_eq!(
+            advertised_tool_names(&loaded_http_app(&path)).await,
+            vec!["second_tool"]
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn fresh_settings_load_serves_only_enabled_custom_tools_over_http() {
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        );
+        let config_path = std::env::temp_dir().join(format!("command-mcp-fresh-{suffix}.toml"));
+        let env_path = std::env::temp_dir().join(format!("command-mcp-fresh-{suffix}.env"));
+        let server = crate::ServerConfig {
+            host: "172.17.0.1".into(),
+            port: 8000,
+            auth_enabled: true,
+            env_file: env_path.display().to_string(),
+            allow_unauthenticated_remote: false,
+        };
+        let tools = vec![
+            test_tool("fresh_enabled", true, "echo {message}"),
+            test_tool("fresh_disabled", false, "echo {message}"),
+        ];
+        save_command_config(&config_path, &BTreeSet::new(), &tools, &server).unwrap();
+        save_env_file(
+            &env_path,
+            &BTreeMap::from([(
+                String::from("COMMAND_MCP_API_KEY"),
+                String::from("test-key"),
+            )]),
+        )
+        .unwrap();
+
+        let config_path_value = config_path.display().to_string();
+        let env_path_value = env_path.display().to_string();
+        let _environment = TestEnvironment::new(&[
+            ("COMMAND_MCP_CONFIG", &config_path_value),
+            ("COMMAND_MCP_ENV_FILE", &env_path_value),
+            ("COMMAND_MCP_HOST", "172.17.0.1"),
+            ("COMMAND_MCP_PORT", "8000"),
+            ("COMMAND_MCP_AUTH_ENABLED", "true"),
+            ("COMMAND_MCP_API_KEY", "test-key"),
+            ("COMMAND_MCP_READ_ROOTS", "."),
+            ("COMMAND_MCP_ALLOW_UNAUTHENTICATED_REMOTE", "false"),
+        ]);
+        let settings = crate::load_settings().unwrap();
+        let app = build_http_app(settings).unwrap();
+
+        assert_eq!(
+            advertised_tool_names(&app).await,
+            vec!["fresh_enabled".to_string()]
+        );
+
+        let _ = fs::remove_file(config_path);
+        let _ = fs::remove_file(env_path);
+    }
+
+    #[tokio::test]
+    async fn http_requires_bearer_auth_but_leaves_health_public() {
+        let app = build_http_app(http_test_settings("172.17.0.1", Some("test-key"))).unwrap();
+
+        let missing = app
+            .clone()
+            .oneshot(mcp_request("172.17.0.1:8000", None, 1, "initialize"))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        let wrong = app
+            .clone()
+            .oneshot(mcp_request(
+                "172.17.0.1:8000",
+                Some("wrong-key"),
+                1,
+                "initialize",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        let health = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/healthz")
+                    .header("host", "172.17.0.1:8000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn http_accepts_configured_host_and_rejects_other_hosts() {
+        let app = build_http_app(http_test_settings("172.17.0.1", Some("test-key"))).unwrap();
+
+        let accepted = app
+            .clone()
+            .oneshot(mcp_request(
+                "172.17.0.1:8000",
+                Some("test-key"),
+                1,
+                "initialize",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), axum::http::StatusCode::OK);
+
+        let rejected = app
+            .oneshot(mcp_request(
+                "localhost:8000",
+                Some("test-key"),
+                1,
+                "initialize",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn ssh_options_prefer_agent_and_disable_forwarding() {
+        let mut agent_args = vec!["ssh".to_string()];
+        append_ssh_security_options(&mut agent_args, "");
+        assert!(agent_args.iter().any(|arg| arg == "BatchMode=yes"));
+        assert!(agent_args.iter().any(|arg| arg == "ForwardAgent=no"));
+        assert!(agent_args.iter().any(|arg| arg == "RequestTTY=no"));
+        assert!(
+            agent_args
+                .iter()
+                .any(|arg| arg == "StrictHostKeyChecking=yes")
+        );
+        assert!(agent_args.iter().any(|arg| arg == "IdentityFile=none"));
+        assert!(!agent_args.iter().any(|arg| arg == "IdentitiesOnly=yes"));
+
+        let mut identity_args = vec!["ssh".to_string()];
+        append_ssh_security_options(&mut identity_args, "/secure/key");
+        assert!(identity_args.iter().any(|arg| arg == "IdentitiesOnly=yes"));
+        assert!(identity_args.iter().any(|arg| arg == "/secure/key"));
+        assert!(!identity_args.iter().any(|arg| arg == "IdentityFile=none"));
     }
 
     #[test]
@@ -1970,8 +2305,10 @@ mod tests {
             configured_tools: Vec::new(),
         })
         .unwrap();
-        assert!(server.get_tool("kmode_root").is_none());
-        assert!(server.get_tool("health").is_some());
+        assert!(server.get_tool("aws").is_none());
+        assert!(server.get_tool("gcloud").is_none());
+        assert!(server.get_tool("health").is_none());
+        assert!(server.get_tool("display_diagnostics").is_none());
     }
 
     #[test]
@@ -2005,6 +2342,31 @@ mod tests {
         let definition = server.get_tool("say_message").expect("configured tool");
         assert_eq!(definition.name, "say_message");
         assert_eq!(definition.input_schema["required"][0], "message");
+    }
+
+    #[test]
+    fn configured_tool_names_reject_spaces_and_periods() {
+        let mut names = BTreeSet::new();
+        let mut tool = ConfiguredTool::default();
+        tool.name = "kmode.dev root command execute".into();
+
+        let error = validate_configured_tool(&tool, &mut names).unwrap_err();
+
+        assert!(error.to_string().contains("must start with a letter"));
+    }
+
+    #[test]
+    fn invalid_custom_tool_name_prevents_fresh_http_startup() {
+        let mut settings = http_test_settings("172.17.0.1", Some("test-key"));
+        settings.configured_tools = vec![test_tool(
+            "kmode.dev root command execute",
+            true,
+            "echo {message}",
+        )];
+
+        let error = build_http_app(settings).err().unwrap();
+
+        assert!(error.to_string().contains("must start with a letter"));
     }
 
     #[test]
