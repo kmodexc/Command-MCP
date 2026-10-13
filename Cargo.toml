@@ -1,0 +1,33 @@
+[package]
+name = "command-mcp"
+version = "0.2.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+chrono = { version = "0.4", features = ["clock", "serde"] }
+clap = { version = "4", features = ["derive"] }
+eframe = "0.36"
+egui = "0.36"
+getrandom = "0.3"
+regex = "1"
+rmcp = { version = "3.4", features = ["server", "macros", "transport-streamable-http-server", "transport-io"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+shell-words = "1"
+subtle = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[bin]]
+name = "command-mcp"
+path = "src/main.rs"
+
+[[bin]]
+name = "command-mcp-ui"
+path = "src/ui.rs"
