@@ -10,6 +10,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use serde::{Deserialize, Serialize};
 
 pub mod commands;
+pub mod ssh;
 
 #[cfg(test)]
 pub(crate) fn test_environment_lock() -> MutexGuard<'static, ()> {
@@ -340,8 +341,20 @@ pub enum ConfiguredToolKind {
     #[default]
     Local,
     SshExec,
+    #[doc(hidden)]
+    #[serde(rename = "ssh_password")]
+    LegacySshPassword,
     ScpUpload,
     Docker,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SshAuthentication {
+    #[default]
+    Agent,
+    IdentityFile,
+    Password,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -365,6 +378,10 @@ fn default_true() -> bool {
 
 fn default_tool_timeout() -> u64 {
     120
+}
+
+fn default_ssh_session_seconds() -> u64 {
+    900
 }
 
 fn default_server_host() -> String {
@@ -429,6 +446,12 @@ pub struct ConfiguredTool {
     #[serde(default)]
     pub ssh_identity_file: String,
     #[serde(default)]
+    pub ssh_authentication: SshAuthentication,
+    #[serde(default)]
+    pub ssh_host_fingerprint: String,
+    #[serde(default = "default_ssh_session_seconds")]
+    pub ssh_session_seconds: u64,
+    #[serde(default)]
     pub upload_source: String,
     #[serde(default = "default_destination_parameter")]
     pub upload_destination_parameter: String,
@@ -459,11 +482,23 @@ impl Default for ConfiguredTool {
             ssh_user: String::new(),
             ssh_port: 22,
             ssh_identity_file: String::new(),
+            ssh_authentication: SshAuthentication::Agent,
+            ssh_host_fingerprint: String::new(),
+            ssh_session_seconds: default_ssh_session_seconds(),
             upload_source: String::new(),
             upload_destination_parameter: "destination".into(),
             dockerfile: String::new(),
             docker_context: String::new(),
             docker_env: Vec::new(),
+        }
+    }
+}
+
+impl ConfiguredTool {
+    pub fn normalize_legacy_ssh_authentication(&mut self) {
+        if self.kind == ConfiguredToolKind::LegacySshPassword {
+            self.kind = ConfiguredToolKind::SshExec;
+            self.ssh_authentication = SshAuthentication::Password;
         }
     }
 }
@@ -503,20 +538,109 @@ pub fn default_enabled_commands() -> BTreeSet<String> {
         .collect()
 }
 
-pub fn command_config_path() -> PathBuf {
-    env::var_os("COMMAND_MCP_CONFIG")
+pub fn app_config_dir() -> Result<PathBuf, String> {
+    if let Some(path) = env::var_os("COMMAND_MCP_CONFIG_DIR") {
+        return Ok(PathBuf::from(path));
+    }
+    #[cfg(windows)]
+    let base = env::var_os("APPDATA")
+        .or_else(|| env::var_os("LOCALAPPDATA"))
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(".command-mcp.toml"))
+        .ok_or_else(|| "APPDATA or LOCALAPPDATA is not set".to_string())?;
+    #[cfg(target_os = "macos")]
+    let base = env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|path| path.join("Library").join("Application Support"))
+        .ok_or_else(|| "HOME is not set".to_string())?;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let base = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|path| PathBuf::from(path).join(".config")))
+        .ok_or_else(|| "XDG_CONFIG_HOME or HOME is not set".to_string())?;
+    #[cfg(not(any(windows, unix)))]
+    let base = env::temp_dir();
+    Ok(base.join("command-mcp"))
 }
 
-pub fn env_file_path(config: &CommandConfig) -> PathBuf {
-    env::var_os("COMMAND_MCP_ENV_FILE")
+pub fn command_config_path() -> Result<PathBuf, String> {
+    env::var_os("COMMAND_MCP_CONFIG")
         .map(PathBuf::from)
-        .or_else(|| {
-            (!config.server.env_file.trim().is_empty())
-                .then(|| PathBuf::from(config.server.env_file.clone()))
+        .map(Ok)
+        .unwrap_or_else(|| app_config_dir().map(|path| path.join("config.toml")))
+}
+
+pub fn env_file_path(config: &CommandConfig) -> Result<PathBuf, String> {
+    if let Some(path) = env::var_os("COMMAND_MCP_ENV_FILE") {
+        return Ok(PathBuf::from(path));
+    }
+    let path = if config.server.env_file.trim().is_empty() {
+        PathBuf::from(".env")
+    } else {
+        PathBuf::from(config.server.env_file.clone())
+    };
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(app_config_dir()?.join(path))
+    }
+}
+
+pub fn app_data_dir() -> Result<PathBuf, String> {
+    if let Some(path) = env::var_os("COMMAND_MCP_DATA_DIR") {
+        return Ok(PathBuf::from(path));
+    }
+    #[cfg(windows)]
+    let base = env::var_os("LOCALAPPDATA")
+        .or_else(|| env::var_os("APPDATA"))
+        .map(PathBuf::from)
+        .ok_or_else(|| "LOCALAPPDATA is not set".to_string())?;
+    #[cfg(target_os = "macos")]
+    let base = env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|path| path.join("Library").join("Application Support"))
+        .ok_or_else(|| "HOME is not set".to_string())?;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let base = env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|path| PathBuf::from(path).join(".local/share")))
+        .ok_or_else(|| "XDG_DATA_HOME or HOME is not set".to_string())?;
+    #[cfg(not(any(windows, unix)))]
+    let base =
+        env::current_dir().map_err(|error| format!("find application data directory: {error}"))?;
+    Ok(base.join("command-mcp"))
+}
+
+pub fn managed_dockerfile_path(tool_name: &str) -> Result<PathBuf, String> {
+    let safe_name = tool_name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                character
+            } else {
+                '_'
+            }
         })
-        .unwrap_or_else(|| PathBuf::from(".env"))
+        .collect::<String>();
+    let safe_name = if safe_name.is_empty() {
+        "unnamed_tool"
+    } else {
+        safe_name.as_str()
+    };
+    Ok(app_data_dir()?
+        .join("dockerfiles")
+        .join(safe_name)
+        .join("Dockerfile"))
+}
+
+pub fn save_dockerfile_content(path: &Path, content: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("create {}: {error}", parent.display()))?;
+    }
+    fs::write(path, content).map_err(|error| format!("write {}: {error}", path.display()))?;
+    set_private_file_permissions(path)
 }
 
 pub fn load_env_file(path: &Path) -> Result<std::collections::BTreeMap<String, String>, String> {
@@ -606,7 +730,12 @@ pub fn load_command_config(path: &Path) -> Result<CommandConfig, String> {
     }
     let text =
         fs::read_to_string(path).map_err(|error| format!("read {}: {error}", path.display()))?;
-    toml::from_str(&text).map_err(|error| format!("parse {}: {error}", path.display()))
+    let mut config: CommandConfig =
+        toml::from_str(&text).map_err(|error| format!("parse {}: {error}", path.display()))?;
+    for tool in &mut config.tools {
+        tool.normalize_legacy_ssh_authentication();
+    }
+    Ok(config)
 }
 
 pub fn save_command_config(
@@ -622,13 +751,20 @@ pub fn save_command_config(
     };
     let text =
         toml::to_string_pretty(&config).map_err(|error| format!("serialize config: {error}"))?;
-    fs::write(path, text).map_err(|error| format!("write {}: {error}", path.display()))
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("create {}: {error}", parent.display()))?;
+    }
+    fs::write(path, text).map_err(|error| format!("write {}: {error}", path.display()))?;
+    set_private_file_permissions(path)
 }
 
 pub fn load_settings() -> Result<Settings, String> {
-    let config_path = command_config_path();
+    let config_path = command_config_path()?;
     let file_config = load_command_config(&config_path)?;
-    let env_path = env_file_path(&file_config);
+    let env_path = env_file_path(&file_config)?;
     load_dotenv(&env_path);
     let enabled_commands = file_config
         .enabled_commands
@@ -758,6 +894,97 @@ mod tests {
         let key = ensure_env_api_key(&path).expect("generate API key");
         assert_eq!(key.len(), 64);
         assert_eq!(load_env_file(&path).unwrap()["COMMAND_MCP_API_KEY"], key);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn managed_dockerfile_is_saved_under_application_data() {
+        let _environment_lock = test_environment_lock();
+        let data_dir = env::temp_dir().join(format!(
+            "command-mcp-test-{}-docker-data",
+            std::process::id()
+        ));
+        let previous = env::var_os("COMMAND_MCP_DATA_DIR");
+        unsafe { env::set_var("COMMAND_MCP_DATA_DIR", &data_dir) };
+
+        let path = managed_dockerfile_path("build-tool").unwrap();
+        save_dockerfile_content(&path, "FROM alpine:3.20\n").unwrap();
+
+        assert!(path.starts_with(&data_dir));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "FROM alpine:3.20\n");
+        unsafe {
+            match previous {
+                Some(value) => env::set_var("COMMAND_MCP_DATA_DIR", value),
+                None => env::remove_var("COMMAND_MCP_DATA_DIR"),
+            }
+        }
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn configuration_defaults_to_application_directory() {
+        let _environment_lock = test_environment_lock();
+        let config_dir = env::temp_dir().join(format!(
+            "command-mcp-test-{}-config-dir",
+            std::process::id()
+        ));
+        let previous_dir = env::var_os("COMMAND_MCP_CONFIG_DIR");
+        let previous_config = env::var_os("COMMAND_MCP_CONFIG");
+        let previous_env = env::var_os("COMMAND_MCP_ENV_FILE");
+        unsafe {
+            env::set_var("COMMAND_MCP_CONFIG_DIR", &config_dir);
+            env::remove_var("COMMAND_MCP_CONFIG");
+            env::remove_var("COMMAND_MCP_ENV_FILE");
+        }
+
+        assert_eq!(
+            command_config_path().unwrap(),
+            config_dir.join("config.toml")
+        );
+        assert_eq!(
+            env_file_path(&CommandConfig::default()).unwrap(),
+            config_dir.join(".env")
+        );
+
+        unsafe {
+            match previous_dir {
+                Some(value) => env::set_var("COMMAND_MCP_CONFIG_DIR", value),
+                None => env::remove_var("COMMAND_MCP_CONFIG_DIR"),
+            }
+            match previous_config {
+                Some(value) => env::set_var("COMMAND_MCP_CONFIG", value),
+                None => env::remove_var("COMMAND_MCP_CONFIG"),
+            }
+            match previous_env {
+                Some(value) => env::set_var("COMMAND_MCP_ENV_FILE", value),
+                None => env::remove_var("COMMAND_MCP_ENV_FILE"),
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_password_ssh_tools_are_migrated_to_ssh_authentication() {
+        let path = env::temp_dir().join(format!(
+            "command-mcp-test-{}-legacy-ssh.toml",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            r#"
+                [[tools]]
+                name = "maintenance"
+                kind = "ssh_password"
+                command = "uname -a"
+            "#,
+        )
+        .unwrap();
+
+        let config = load_command_config(&path).unwrap();
+        assert_eq!(config.tools[0].kind, ConfiguredToolKind::SshExec);
+        assert_eq!(
+            config.tools[0].ssh_authentication,
+            SshAuthentication::Password
+        );
         let _ = fs::remove_file(path);
     }
 

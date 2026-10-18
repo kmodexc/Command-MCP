@@ -8,5 +8,7 @@ dist/
 build/
 *.egg-info/
 .env
+.command-mcp.toml
+command-mcp.toml
 target/
 .codex/

@@ -13,6 +13,7 @@ egui = "0.36"
 getrandom = "0.3"
 regex = "1"
 rmcp = { version = "3.4", features = ["server", "macros", "transport-streamable-http-server", "transport-io"] }
+russh = { version = "0.64.1", default-features = false, features = ["aws-lc-rs", "flate2", "rsa"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = "1"
@@ -23,6 +24,7 @@ tokio-util = "0.7"
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zeroize = "1"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

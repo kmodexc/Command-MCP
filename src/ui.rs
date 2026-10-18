@@ -2,14 +2,19 @@ mod ui_server;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs,
     path::PathBuf,
 };
 
+use zeroize::Zeroize;
+
 use command_mcp::{
     COMMAND_GROUPS, COMMAND_SPECS, CommandConfig, CommandGroup, ConfiguredTool, ConfiguredToolKind,
-    ToolParameter, command_config_path, default_enabled_commands, ensure_env_api_key,
-    env_file_path, load_command_config, load_env_file, save_command_config, save_env_file,
+    SshAuthentication, ToolParameter, command_config_path, default_enabled_commands,
+    ensure_env_api_key, env_file_path, load_command_config, load_env_file, save_command_config,
+    save_env_file,
 };
+use command_mcp::{commands::validate_configured_tools, ssh::SshControlEvent};
 use ui_server::{ServerLaunchConfig, ServerProcess};
 
 #[derive(Clone, PartialEq, Eq)]
@@ -30,13 +35,21 @@ struct CommandMcpApp {
     reveal_secrets: bool,
     restart_required: bool,
     docker_env_draft: String,
+    dockerfile_drafts: BTreeMap<String, String>,
     new_env_key: String,
+    ssh_password_draft: String,
+    ssh_password_tool: Option<String>,
 }
 
 impl CommandMcpApp {
     fn new() -> Self {
-        let config_path = command_config_path();
         let mut startup_errors = Vec::new();
+        let config_path = command_config_path().unwrap_or_else(|error| {
+            startup_errors.push(format!(
+                "Could not determine the application config directory: {error}"
+            ));
+            PathBuf::new()
+        });
         let mut config = match load_command_config(&config_path) {
             Ok(config) => config,
             Err(error) => {
@@ -50,7 +63,15 @@ impl CommandMcpApp {
         if config.enabled_commands.is_none() {
             config.enabled_commands = Some(default_enabled_commands());
         }
-        let env_path = env_file_path(&config);
+        let env_path = match env_file_path(&config) {
+            Ok(path) => path,
+            Err(error) => {
+                startup_errors.push(format!(
+                    "Could not determine the application data directory: {error}"
+                ));
+                PathBuf::new()
+            }
+        };
         let mut env_values = match load_env_file(&env_path) {
             Ok(values) => values,
             Err(error) => {
@@ -87,7 +108,10 @@ impl CommandMcpApp {
             reveal_secrets: false,
             restart_required: false,
             docker_env_draft: String::new(),
+            dockerfile_drafts: BTreeMap::new(),
             new_env_key: String::new(),
+            ssh_password_draft: String::new(),
+            ssh_password_tool: None,
         };
         if let Err(error) = app.start_server() {
             startup_errors.push(error);
@@ -156,6 +180,9 @@ impl CommandMcpApp {
     }
 
     fn persist_changes(&mut self) -> Result<(), String> {
+        self.sync_dockerfiles()?;
+        validate_configured_tools(&self.config.tools)
+            .map_err(|error| format!("tool configuration is invalid: {error}"))?;
         self.config.server.env_file = self.env_path.display().to_string();
         let enabled = self
             .config
@@ -174,6 +201,55 @@ impl CommandMcpApp {
             &self.config.server,
         )?;
         self.config.enabled_commands = Some(enabled);
+        Ok(())
+    }
+
+    fn prepare_dockerfile(&mut self, index: usize) -> Result<(), String> {
+        let tool = self
+            .config
+            .tools
+            .get(index)
+            .ok_or_else(|| "configured tool no longer exists".to_string())?;
+        if tool.kind != ConfiguredToolKind::Docker {
+            return Ok(());
+        }
+        let name = tool.name.clone();
+        let legacy_path = tool.dockerfile.clone();
+        let managed_path = command_mcp::managed_dockerfile_path(&name)?;
+        if !self.dockerfile_drafts.contains_key(&name) {
+            let content = fs::read_to_string(&managed_path)
+                .or_else(|_| {
+                    if legacy_path.trim().is_empty() {
+                        Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+                    } else {
+                        fs::read_to_string(&legacy_path)
+                    }
+                })
+                .unwrap_or_default();
+            self.dockerfile_drafts.insert(name.clone(), content);
+        }
+        if self.config.tools[index].dockerfile != managed_path.display().to_string() {
+            self.config.tools[index].dockerfile = managed_path.display().to_string();
+            self.restart_required = true;
+        }
+        Ok(())
+    }
+
+    fn sync_dockerfiles(&mut self) -> Result<(), String> {
+        for index in 0..self.config.tools.len() {
+            if self.config.tools[index].kind != ConfiguredToolKind::Docker {
+                continue;
+            }
+            self.prepare_dockerfile(index)?;
+            let name = self.config.tools[index].name.clone();
+            let path = command_mcp::managed_dockerfile_path(&name)?;
+            let content = self
+                .dockerfile_drafts
+                .get(&name)
+                .cloned()
+                .unwrap_or_default();
+            command_mcp::save_dockerfile_content(&path, &content)?;
+        }
         Ok(())
     }
 
@@ -221,6 +297,41 @@ impl CommandMcpApp {
         Ok(())
     }
 
+    fn connect_ssh_password(&mut self, tool: String) {
+        if self.restart_required {
+            self.status =
+                "Save the tool and restart the server before opening an SSH session.".into();
+            return;
+        }
+        let password = std::mem::take(&mut self.ssh_password_draft);
+        if password.is_empty() {
+            self.status = "Enter the SSH password before connecting.".into();
+            return;
+        }
+        let Some(server) = self.server.as_mut() else {
+            self.status = "The MCP server is not running.".into();
+            return;
+        };
+        match server.send_control(command_mcp::ssh::SshControlRequest::Connect {
+            tool,
+            password: command_mcp::ssh::SensitiveString::new(password),
+        }) {
+            Ok(()) => self.status = "SSH access request sent to the server.".into(),
+            Err(error) => self.report_error("Could not request SSH access", error),
+        }
+    }
+
+    fn revoke_ssh_password(&mut self, tool: String) {
+        let Some(server) = self.server.as_mut() else {
+            self.status = "The MCP server is not running.".into();
+            return;
+        };
+        match server.send_control(command_mcp::ssh::SshControlRequest::Revoke { tool }) {
+            Ok(()) => self.status = "SSH access revoked.".into(),
+            Err(error) => self.report_error("Could not revoke SSH access", error),
+        }
+    }
+
     fn restart_server(&mut self) {
         let stop_error = self.stop_server().err();
         let start_error = self.start_server().err();
@@ -246,6 +357,7 @@ impl CommandMcpApp {
     }
 
     fn poll_server(&mut self) {
+        self.poll_control_events();
         let exit = match self.server.as_mut() {
             Some(server) => match server.try_wait() {
                 Ok(exit) => exit,
@@ -271,8 +383,40 @@ impl CommandMcpApp {
         }
     }
 
+    fn poll_control_events(&mut self) {
+        let events = self
+            .server
+            .as_mut()
+            .map(ServerProcess::drain_control_events)
+            .unwrap_or_default();
+        for line in events {
+            match serde_json::from_str::<SshControlEvent>(&line) {
+                Ok(SshControlEvent::Connected { tool }) => {
+                    self.status = format!("SSH access granted for tool {tool:?}.");
+                }
+                Ok(SshControlEvent::Revoked { tool }) => {
+                    self.status = format!("SSH access revoked for tool {tool:?}.");
+                }
+                Ok(SshControlEvent::Error { tool, message }) => {
+                    self.status = match tool {
+                        Some(tool) => format!("SSH tool {tool:?} failed: {message}"),
+                        None => format!("Server control error: {message}"),
+                    };
+                }
+                Err(error) => {
+                    self.report_error("Could not read a server control event", error);
+                }
+            }
+        }
+    }
+
     fn add_tool(&mut self) {
+        self.add_tool_kind(ConfiguredToolKind::Local);
+    }
+
+    fn add_tool_kind(&mut self, kind: ConfiguredToolKind) {
         let mut tool = ConfiguredTool::default();
+        tool.kind = kind;
         let base = tool.name.clone();
         let mut suffix = 2;
         while self.config.tools.iter().any(|item| item.name == tool.name) {
@@ -467,8 +611,18 @@ impl CommandMcpApp {
     fn draw_tool_editor(&mut self, ui: &mut egui::Ui, index: usize) -> (bool, bool) {
         let mut save = false;
         let mut delete = false;
+        let mut connect_password = false;
+        let mut revoke_password = false;
         if index >= self.config.tools.len() {
             return (save, delete);
+        }
+        let selected_tool_name = self.config.tools[index].name.clone();
+        if self.ssh_password_tool.as_deref() != Some(selected_tool_name.as_str()) {
+            self.ssh_password_draft.zeroize();
+            self.ssh_password_tool = Some(selected_tool_name);
+        }
+        if let Err(error) = self.prepare_dockerfile(index) {
+            self.report_error("Could not prepare Dockerfile storage", error);
         }
         let original = self.config.tools[index].clone();
         let tool = &mut self.config.tools[index];
@@ -522,6 +676,9 @@ impl CommandMcpApp {
             ui.add_space(12.0);
             ui.label("SSH connection");
             let mut use_agent = tool.ssh_identity_file.trim().is_empty();
+            let mut authentication = tool.ssh_authentication.clone();
+            let password_auth = tool.kind == ConfiguredToolKind::SshExec
+                && authentication == SshAuthentication::Password;
             egui::Grid::new("ssh_properties")
                 .num_columns(2)
                 .spacing([12.0, 8.0])
@@ -535,20 +692,80 @@ impl CommandMcpApp {
                     ui.label("Port");
                     ui.add(egui::DragValue::new(&mut tool.ssh_port).range(0..=65535));
                     ui.end_row();
-                    ui.label("Authentication");
-                    egui::ComboBox::from_id_salt(("ssh_authentication", index))
-                        .selected_text(if use_agent {
-                            "SSH agent"
-                        } else {
-                            "Identity file / FIDO2 key"
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut use_agent, true, "SSH agent");
-                            ui.selectable_value(&mut use_agent, false, "Identity file / FIDO2 key");
-                        });
-                    ui.end_row();
+                    if tool.kind == ConfiguredToolKind::SshExec {
+                        ui.label("Authentication");
+                        egui::ComboBox::from_id_salt(("ssh_authentication", index))
+                            .selected_text(ssh_authentication_label(&authentication))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut authentication,
+                                    SshAuthentication::Agent,
+                                    "SSH agent",
+                                );
+                                ui.selectable_value(
+                                    &mut authentication,
+                                    SshAuthentication::IdentityFile,
+                                    "Identity file / FIDO2 key",
+                                );
+                                ui.selectable_value(
+                                    &mut authentication,
+                                    SshAuthentication::Password,
+                                    "Password (russh session)",
+                                );
+                            });
+                        ui.end_row();
+                    } else {
+                        ui.label("Authentication");
+                        egui::ComboBox::from_id_salt(("ssh_authentication", index))
+                            .selected_text(if use_agent {
+                                "SSH agent"
+                            } else {
+                                "Identity file / FIDO2 key"
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut use_agent, true, "SSH agent");
+                                ui.selectable_value(
+                                    &mut use_agent,
+                                    false,
+                                    "Identity file / FIDO2 key",
+                                );
+                            });
+                        ui.end_row();
+                    }
+                    if password_auth {
+                        ui.label("Host fingerprint");
+                        ui.text_edit_singleline(&mut tool.ssh_host_fingerprint);
+                        ui.end_row();
+                        ui.label("Access lifetime (seconds)");
+                        ui.add(egui::DragValue::new(&mut tool.ssh_session_seconds).range(1..=3600));
+                        ui.end_row();
+                    }
                 });
-            if use_agent {
+            tool.ssh_authentication = authentication;
+            if password_auth {
+                ui.add_space(8.0);
+                ui.group(|ui| {
+                    ui.heading("Temporary SSH access");
+                    ui.small("Enter the password here to open the configured russh session. It is never saved in the tool configuration.");
+                    ui.horizontal(|ui| {
+                        ui.label("Password");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.ssh_password_draft)
+                                .password(true)
+                                .hint_text("enter password for this session"),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Connect for lifetime").clicked() {
+                            connect_password = true;
+                        }
+                        if ui.button("Revoke access").clicked() {
+                            revoke_password = true;
+                        }
+                    });
+                });
+                ui.small("The server pins the host key, authenticates once, keeps the russh session in memory, and closes it automatically when this lifetime ends.");
+            } else if use_agent {
                 tool.ssh_identity_file.clear();
                 ui.small("Recommended: use the local SSH agent. The private key stays outside this application; load it with ssh-add and use a short lifetime or confirmation mode.");
             } else {
@@ -559,7 +776,11 @@ impl CommandMcpApp {
                     "The path is saved in the configuration. The private key is never copied, but an unencrypted key file can be used by anyone who reads it. Prefer SSH agent or a hardware-backed FIDO2 key.",
                 );
             }
-            ui.small("Remote calls use batch mode, disable agent forwarding, disable TTY allocation, and require an existing known_hosts entry. New host keys are not accepted automatically.");
+            if password_auth {
+                ui.small("Password sessions use the pinned SHA-256 fingerprint above; they do not consult known_hosts.");
+            } else {
+                ui.small("Remote calls use batch mode, disable agent forwarding, disable TTY allocation, and require an existing known_hosts entry. New host keys are not accepted automatically.");
+            }
         }
 
         if tool.kind == ConfiguredToolKind::ScpUpload {
@@ -585,13 +806,23 @@ impl CommandMcpApp {
                 .num_columns(2)
                 .spacing([12.0, 8.0])
                 .show(ui, |ui| {
-                    ui.label("Dockerfile");
-                    ui.text_edit_singleline(&mut tool.dockerfile);
+                    ui.label("Dockerfile storage");
+                    ui.monospace(&tool.dockerfile);
                     ui.end_row();
                     ui.label("Build context");
                     ui.text_edit_singleline(&mut tool.docker_context);
                     ui.end_row();
                 });
+            ui.label("Dockerfile content");
+            ui.small("Paste or edit the Dockerfile. It is stored under the application data directory and written when you save the tool.");
+            if let Some(content) = self.dockerfile_drafts.get_mut(&tool.name) {
+                ui.add(
+                    egui::TextEdit::multiline(content)
+                        .desired_rows(14)
+                        .desired_width(f32::INFINITY)
+                        .code_editor(),
+                );
+            }
             ui.small("The image is built and then run when the MCP tool is called. Docker must be installed and available to the server process.");
             ui.label("Secrets passed into the container");
             ui.small("Add names from the environment file. Values stay in the server environment and are passed with Docker's --env KEY form.");
@@ -677,12 +908,20 @@ impl CommandMcpApp {
         if *tool != original {
             self.restart_required = true;
         }
+        let control_tool = tool.name.clone();
+        if connect_password {
+            self.connect_ssh_password(control_tool.clone());
+        }
+        if revoke_password {
+            self.revoke_ssh_password(control_tool);
+        }
         (save, delete)
     }
 }
 
 impl Drop for CommandMcpApp {
     fn drop(&mut self) {
+        self.ssh_password_draft.zeroize();
         if let Err(error) = self.stop_server() {
             eprintln!("Could not stop the server while closing the UI: {error}");
         }
@@ -826,6 +1065,17 @@ impl eframe::App for CommandMcpApp {
                         if ui.button("+ New").clicked() {
                             self.add_tool();
                         }
+                        if ui.button("+ SSH (password auth)").clicked() {
+                            self.add_tool_kind(ConfiguredToolKind::SshExec);
+                            if let Some(Selection::Configured(index)) = self.selection
+                                && let Some(tool) = self.config.tools.get_mut(index)
+                            {
+                                tool.ssh_authentication = SshAuthentication::Password;
+                            }
+                        }
+                        if ui.button("+ Docker").clicked() {
+                            self.add_tool_kind(ConfiguredToolKind::Docker);
+                        }
                         if ui.small_button("All").clicked() {
                             configured_action = Some(true);
                         }
@@ -890,8 +1140,17 @@ fn kind_label(kind: &ConfiguredToolKind) -> &'static str {
     match kind {
         ConfiguredToolKind::Local => "Local command",
         ConfiguredToolKind::SshExec => "SSH command",
+        ConfiguredToolKind::LegacySshPassword => "Legacy SSH password tool",
         ConfiguredToolKind::ScpUpload => "SCP file upload",
         ConfiguredToolKind::Docker => "Dockerfile command",
+    }
+}
+
+fn ssh_authentication_label(authentication: &SshAuthentication) -> &'static str {
+    match authentication {
+        SshAuthentication::Agent => "SSH agent",
+        SshAuthentication::IdentityFile => "Identity file / FIDO2 key",
+        SshAuthentication::Password => "Password (russh session)",
     }
 }
 
@@ -996,7 +1255,10 @@ mod tests {
             reveal_secrets: false,
             restart_required: true,
             docker_env_draft: String::new(),
+            dockerfile_drafts: BTreeMap::new(),
             new_env_key: String::new(),
+            ssh_password_draft: String::new(),
+            ssh_password_tool: None,
         }
     }
 
@@ -1263,6 +1525,60 @@ mod tests {
 
         let _ = fs::remove_dir(config_path);
         let _ = fs::remove_file(env_path);
+    }
+
+    #[test]
+    fn invalid_tool_configuration_is_reported_before_writing() {
+        let config_path = test_path("invalid-tool-save", "toml");
+        let env_path = test_path("invalid-tool-save", "env");
+        let mut app = test_app(config_path.clone(), env_path.clone());
+        app.config.tools.push(ConfiguredTool {
+            name: "invalid tool name".into(),
+            enabled: true,
+            ..ConfiguredTool::default()
+        });
+
+        app.save_changes();
+
+        assert!(app.status.contains("tool configuration is invalid"));
+        assert!(!config_path.exists());
+        let _ = fs::remove_file(env_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn asynchronous_server_control_errors_are_shown_in_the_ui_status() {
+        let _environment_lock = environment_lock();
+        let script_path = executable_script(
+            "control-error",
+            "#!/bin/sh\nprintf '%s\\n' '{\"event\":\"error\",\"tool\":\"maintenance\",\"message\":\"authentication failed\"}'\nsleep 2\n",
+        );
+        let previous_binary = env::var_os("COMMAND_MCP_SERVER_BIN");
+        unsafe { env::set_var("COMMAND_MCP_SERVER_BIN", &script_path) };
+        let mut app = test_app(
+            test_path("control-error", "toml"),
+            test_path("control-error", "env"),
+        );
+
+        app.restart_server();
+        for _ in 0..100 {
+            app.poll_server();
+            if app.status.contains("authentication failed") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(app.status.contains("SSH tool \"maintenance\" failed"));
+        assert!(app.status.contains("authentication failed"));
+        app.stop_server().unwrap();
+        unsafe {
+            match previous_binary {
+                Some(value) => env::set_var("COMMAND_MCP_SERVER_BIN", value),
+                None => env::remove_var("COMMAND_MCP_SERVER_BIN"),
+            }
+        }
+        let _ = fs::remove_file(script_path);
     }
 
     #[test]

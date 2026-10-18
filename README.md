@@ -15,7 +15,8 @@ Requires Rust 1.99+.
 
 ```bash
 # Put a long random value in COMMAND_MCP_API_KEY before exposing it beyond localhost.
-# If this is omitted, the UI/server writes a cryptographically random value to .env.
+# If this is omitted, the UI/server writes a cryptographically random value to
+# the platform application configuration directory.
 export COMMAND_MCP_API_KEY=replace-with-a-long-random-secret
 cargo run --bin command-mcp -- server
 ```
@@ -29,9 +30,9 @@ cargo run --bin command-mcp-ui
 The UI starts and owns the local MCP server process. It shows built-in commands
 in groups with quick enable-all and disable-all controls, alongside configured
 tools in a collapsible tree catalog. New configurations keep all predefined
-commands disabled until you explicitly enable them. Saving a change writes
-`.command-mcp.toml` and clearly marks the server as needing a restart; use the
-restart button to apply it.
+commands disabled until you explicitly enable them. Saving a change writes the
+configuration to the platform application configuration directory and clearly
+marks the server as needing a restart; use the restart button to apply it.
 
 Connect an MCP client to `http://127.0.0.1:8000/mcp`. If an API key is configured,
 send it as `Authorization: Bearer <key>`.
@@ -165,11 +166,16 @@ using a local shell.
 Configured tools have four kinds:
 
 - `Local command` runs an executable on the MCP server host.
-- `SSH command` runs the configured command through the local OpenSSH client.
+- `SSH command` runs the configured command through the local OpenSSH client,
+  or through a persistent russh session when password authentication is chosen.
+  Its authentication choices are SSH agent, identity file/FIDO2 key, and
+  password.
 - `SCP file upload` uploads a UI-selected local file with `scp`; the LLM
   supplies the remote destination parameter.
 - `Dockerfile command` builds the configured Dockerfile and runs the rendered
-  command in the resulting container.
+  command in the resulting container. The UI edits the Dockerfile as text and
+  stores it under the platform's application data directory, while the build
+  context remains a separately selected directory.
 
 SSH tools use the local SSH agent by default; passwords and private key contents
 are never stored in the configuration. You can select an identity file or FIDO2
@@ -183,6 +189,21 @@ supplied to the OpenSSH client as arguments. Docker tools require `docker` in
 the server process PATH. These configurable tools are disabled by default until
 explicitly enabled in the UI.
 
+SSH password authentication requires the SSH user and a pinned SHA-256 host fingerprint in
+the form `SHA256:...`. The UI sends the password over a private pipe to the
+UI-owned local server; it is wrapped in a zeroizing type, used for the one-time
+authentication exchange, and never written to the configuration. The session
+closes automatically after 15 minutes by default, or sooner when you revoke it
+or close the UI. The server rejects commands until the session has been
+connected. Keep the MCP bearer token protected as well: anyone who can call the
+MCP endpoint can use an enabled password-session tool while its access session
+is open.
+
+The application uses russh 0.64.1. The application-owned password buffers are
+zeroized on destruction, but full memory erasure also depends on the russh
+packet-buffer fix being applied; use the project fork or a released russh
+version containing that fix when handling high-value credentials.
+
 Docker tools can receive secrets from the environment file without putting
 secret values in the Docker command arguments. Add variables such as
 `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, or `API_TOKEN` in the
@@ -194,6 +215,21 @@ The “Server and environment” editor controls the environment file, bind host
 port, bearer authentication, generated API password, and unauthenticated remote
 bind approval. Saving changes shows “Restart required”; use “Restart now” to
 apply them. The API password is masked until “Show” is selected.
+
+The configuration and API password are stored outside the project directory.
+On Linux the configuration is under `$XDG_CONFIG_HOME/command-mcp` or
+`~/.config/command-mcp`; on Windows it is under `%APPDATA%\command-mcp`; macOS
+uses `~/Library/Application Support/command-mcp`. Set
+`COMMAND_MCP_CONFIG_DIR` to choose a different configuration directory.
+
+Dockerfile content is stored outside `config.toml`. On Linux it is under
+`$XDG_DATA_HOME/command-mcp/dockerfiles` or
+`~/.local/share/command-mcp/dockerfiles`; on Windows it is under
+`%LOCALAPPDATA%\command-mcp\dockerfiles`; macOS uses
+`~/Library/Application Support/command-mcp/dockerfiles`. Set
+`COMMAND_MCP_DATA_DIR` to choose a different application data root. Existing
+Dockerfile paths are imported into the managed location when the tool is opened
+in the UI.
 
 For a USB-C monitor issue, start with `display_diagnostics`. It returns a structured
 snapshot of the USB tree, PCI driver bindings, DRM state, Type-C Alt Modes, loaded
@@ -242,13 +278,15 @@ should be editable without recompiling the server.
 | `COMMAND_MCP_PORT` | `8000` | TCP port |
 | `COMMAND_MCP_API_KEY` | empty | Static bearer token; use only behind TLS |
 | `COMMAND_MCP_AUTH_ENABLED` | `true` | Require the bearer API password |
-| `COMMAND_MCP_ENV_FILE` | `.env` | Environment file used for authentication and Docker secrets |
+| `COMMAND_MCP_ENV_FILE` | platform config directory (`.env`) | Environment file used for authentication and Docker secrets; explicit override |
 | `COMMAND_MCP_READ_ROOTS` | current working directory | Comma-separated roots available to `ls` and `cat` |
-| `COMMAND_MCP_CONFIG` | `.command-mcp.toml` | Built-in command and configured tool catalog |
+| `COMMAND_MCP_CONFIG` | platform config directory (`config.toml`) | Built-in command and configured tool catalog; explicit override |
+| `COMMAND_MCP_CONFIG_DIR` | platform config directory | Configuration directory override |
 | `COMMAND_MCP_UI_PORT` | `COMMAND_MCP_PORT` or `8000` | Port used by the UI-owned local server |
 | `COMMAND_MCP_SERVER_BIN` | sibling `command-mcp` binary | Server executable launched by the UI |
 | `COMMAND_MCP_ALLOW_UNAUTHENTICATED_REMOTE` | `false` | Permit a non-loopback bind without an API key |
 | `COMMAND_MCP_ALLOW_SENSITIVE_FILE_READS` | `false` | Permit `ls`/`cat` access to common credential paths |
+| `COMMAND_MCP_DATA_DIR` | platform application data directory | Root directory for managed Dockerfile content |
 
 ## Production notes
 

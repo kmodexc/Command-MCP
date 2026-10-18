@@ -1,7 +1,7 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     env,
-    io::{BufReader, Read},
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
@@ -11,6 +11,9 @@ use std::{
     thread,
     time::Duration,
 };
+
+use command_mcp::ssh::SshControlRequest;
+use zeroize::Zeroize;
 
 pub(crate) struct ServerLaunchConfig<'a> {
     pub binary: Option<&'a Path>,
@@ -30,6 +33,8 @@ pub(crate) struct ServerExit {
 
 pub(crate) struct ServerProcess {
     child: Child,
+    stdin: Option<std::process::ChildStdin>,
+    control_events: Arc<Mutex<VecDeque<String>>>,
     stderr: Option<StderrCapture>,
 }
 
@@ -86,8 +91,9 @@ impl ServerProcess {
                     .cloned()
                     .unwrap_or_default(),
             )
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .env("COMMAND_MCP_CONTROL", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| {
@@ -113,6 +119,23 @@ impl ServerProcess {
                 )
             });
         };
+        let Some(stdout) = child.stdout.take() else {
+            let kill_error = child.kill().err();
+            let wait_error = child.wait().err();
+            let cleanup = [kill_error, wait_error]
+                .into_iter()
+                .flatten()
+                .map(|error| error.to_string())
+                .collect::<Vec<_>>();
+            return Err(if cleanup.is_empty() {
+                "Could not capture the server control output".into()
+            } else {
+                format!(
+                    "Could not capture the server control output: {}",
+                    cleanup.join("; ")
+                )
+            });
+        };
 
         let output = Arc::new(Mutex::new(StderrOutput::default()));
         let reader_output = Arc::clone(&output);
@@ -132,10 +155,56 @@ impl ServerProcess {
             reader_finished.store(true, Ordering::Release);
         });
 
+        let control_events = Arc::new(Mutex::new(VecDeque::new()));
+        let reader_events = Arc::clone(&control_events);
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if line.len() > 64 * 1024 {
+                    continue;
+                }
+                let mut events = reader_events
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if events.len() >= 128 {
+                    events.pop_front();
+                }
+                events.push_back(line);
+            }
+        });
+
+        let stdin = child.stdin.take();
         Ok(Self {
             child,
+            stdin,
+            control_events,
             stderr: Some(StderrCapture { output, finished }),
         })
+    }
+
+    pub fn send_control(&mut self, request: SshControlRequest) -> Result<(), String> {
+        let mut encoded = serde_json::to_vec(&request)
+            .map_err(|error| format!("Could not encode SSH control request: {error}"))?;
+        encoded.push(b'\n');
+        let result = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "The server control channel is closed".to_string())
+            .and_then(|stdin| {
+                stdin
+                    .write_all(&encoded)
+                    .and_then(|_| stdin.flush())
+                    .map_err(|error| format!("Could not send SSH control request: {error}"))
+            });
+        encoded.zeroize();
+        result
+    }
+
+    pub fn drain_control_events(&mut self) -> Vec<String> {
+        let mut events = self
+            .control_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        events.drain(..).collect()
     }
 
     #[cfg(test)]
@@ -154,10 +223,12 @@ impl ServerProcess {
         let stderr = self
             .finish_stderr_capture()
             .unwrap_or_else(|error| error.to_string());
+        self.stdin.take();
         Ok(Some(ServerExit { status, stderr }))
     }
 
     pub fn stop(mut self) -> Result<(), String> {
+        self.stdin.take();
         let kill_error = self.child.kill().err();
         let wait_error = self.child.wait().err();
         let stderr_error = self.finish_stderr_capture().err();

@@ -30,7 +30,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::{io::AsyncRead, process::Command, sync::Mutex, time::timeout};
 
-use crate::{COMMAND_SPECS, ConfiguredTool, ConfiguredToolKind, Settings, spec};
+use crate::{
+    COMMAND_SPECS, ConfiguredTool, ConfiguredToolKind, Settings, SshAuthentication, spec,
+    ssh::{SshExecutionResult, SshSessionRegistry},
+};
 
 pub const MAX_OUTPUT_BYTES: usize = 200_000;
 
@@ -171,20 +174,24 @@ pub struct PciArgs {
 pub struct McpServer {
     pub settings: Settings,
     pub tool_router: ToolRouter<Self>,
+    pub ssh_sessions: Arc<SshSessionRegistry>,
 }
 
 impl McpServer {
-    pub fn new(settings: Settings) -> anyhow::Result<Self> {
+    pub fn new(mut settings: Settings) -> anyhow::Result<Self> {
+        for tool in &mut settings.configured_tools {
+            tool.normalize_legacy_ssh_authentication();
+        }
         let mut tool_router = Self::tool_router();
         for spec in COMMAND_SPECS {
             if !settings.enabled_commands.contains(spec.name) {
                 tool_router.disable_route(spec.name);
             }
         }
-        let mut names = BTreeSet::new();
+        let ssh_sessions = Arc::new(SshSessionRegistry::default());
+        validate_configured_tools(&settings.configured_tools)?;
         for configured_tool in &settings.configured_tools {
-            validate_configured_tool(configured_tool, &mut names)?;
-            let route = configured_tool_route(configured_tool.clone());
+            let route = configured_tool_route(configured_tool.clone(), Arc::clone(&ssh_sessions));
             let name = configured_tool.name.clone();
             tool_router.add_route(route);
             if !configured_tool.enabled {
@@ -194,6 +201,7 @@ impl McpServer {
         Ok(Self {
             settings,
             tool_router,
+            ssh_sessions,
         })
     }
 
@@ -789,6 +797,14 @@ impl McpServer {
     }
 }
 
+pub fn validate_configured_tools(tools: &[ConfiguredTool]) -> anyhow::Result<()> {
+    let mut names = BTreeSet::new();
+    for tool in tools {
+        validate_configured_tool(tool, &mut names)?;
+    }
+    Ok(())
+}
+
 fn validate_configured_tool(
     tool: &ConfiguredTool,
     names: &mut BTreeSet<String>,
@@ -856,6 +872,23 @@ fn validate_configured_tool(
                 if tool.ssh_host.trim().is_empty() {
                     anyhow::bail!("SSH tool {:?} needs an SSH host", tool.name);
                 }
+                if tool.ssh_authentication == SshAuthentication::Password {
+                    if tool.ssh_user.trim().is_empty() {
+                        anyhow::bail!("SSH password tool {:?} needs an SSH user", tool.name);
+                    }
+                    if tool.ssh_host_fingerprint.trim().is_empty() {
+                        anyhow::bail!(
+                            "SSH password tool {:?} needs a pinned SHA-256 host fingerprint",
+                            tool.name
+                        );
+                    }
+                    if !(1..=3600).contains(&tool.ssh_session_seconds) {
+                        anyhow::bail!(
+                            "SSH password tool {:?} session lifetime must be between 1 and 3600 seconds",
+                            tool.name
+                        );
+                    }
+                }
             }
             ConfiguredToolKind::ScpUpload => {
                 if tool.ssh_host.trim().is_empty() {
@@ -880,7 +913,7 @@ fn validate_configured_tool(
                     );
                 }
             }
-            ConfiguredToolKind::Local => {}
+            ConfiguredToolKind::Local | ConfiguredToolKind::LegacySshPassword => {}
         }
     }
     let env_key_re = Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$")?;
@@ -935,11 +968,17 @@ fn configured_tool_schema(tool: &ConfiguredTool) -> Tool {
     )
 }
 
-fn configured_tool_route(tool: ConfiguredTool) -> ToolRoute<McpServer> {
+fn configured_tool_route(
+    tool: ConfiguredTool,
+    ssh_sessions: Arc<SshSessionRegistry>,
+) -> ToolRoute<McpServer> {
     let definition = configured_tool_schema(&tool);
     ToolRoute::new_dyn(definition, move |context| {
         let tool = tool.clone();
-        Box::pin(async move { execute_configured_tool(&tool, context.arguments).await })
+        let ssh_sessions = Arc::clone(&ssh_sessions);
+        Box::pin(
+            async move { execute_configured_tool(&tool, context.arguments, ssh_sessions).await },
+        )
     })
 }
 
@@ -1035,6 +1074,7 @@ fn render_command(
 async fn execute_configured_tool(
     tool: &ConfiguredTool,
     arguments: Option<JsonObject>,
+    ssh_sessions: Arc<SshSessionRegistry>,
 ) -> Result<CallToolResponse, McpError> {
     let values = configured_arguments(tool, arguments)?;
     let mut result = match tool.kind {
@@ -1047,16 +1087,30 @@ async fn execute_configured_tool(
             )
             .await
         }
-        ConfiguredToolKind::SshExec => {
-            let mut argv = vec!["ssh".into()];
-            if tool.ssh_port != 0 {
-                argv.extend(["-p".into(), tool.ssh_port.to_string()]);
-            }
-            append_ssh_security_options(&mut argv, &tool.ssh_identity_file);
-            argv.push(ssh_target(tool));
+        ConfiguredToolKind::SshExec | ConfiguredToolKind::LegacySshPassword => {
             let remote_command = render_command(&tool.command, &values)?;
-            argv.push(shell_words::join(remote_command));
-            run_read_only(argv, tool.timeout_seconds, None, true).await
+            if tool.kind == ConfiguredToolKind::LegacySshPassword
+                || tool.ssh_authentication == SshAuthentication::Password
+            {
+                let result = ssh_sessions
+                    .execute(
+                        &tool.name,
+                        shell_words::join(remote_command),
+                        tool.timeout_seconds,
+                    )
+                    .await
+                    .map_err(McpServer::error)?;
+                ssh_command_result(result, tool)
+            } else {
+                let mut argv = vec!["ssh".into()];
+                if tool.ssh_port != 0 {
+                    argv.extend(["-p".into(), tool.ssh_port.to_string()]);
+                }
+                append_ssh_security_options(&mut argv, &tool.ssh_identity_file);
+                argv.push(ssh_target(tool));
+                argv.push(shell_words::join(remote_command));
+                run_read_only(argv, tool.timeout_seconds, None, true).await
+            }
         }
         ConfiguredToolKind::ScpUpload => {
             let source = PathBuf::from(&tool.upload_source);
@@ -1136,7 +1190,11 @@ async fn execute_configured_tool(
     };
     let (mode, mutating) = match tool.kind {
         ConfiguredToolKind::Local => ("execute", true),
+        ConfiguredToolKind::SshExec if tool.ssh_authentication == SshAuthentication::Password => {
+            ("ssh_russh", true)
+        }
         ConfiguredToolKind::SshExec => ("ssh", true),
+        ConfiguredToolKind::LegacySshPassword => ("ssh_russh", true),
         ConfiguredToolKind::Docker => ("docker", true),
         ConfiguredToolKind::ScpUpload => ("upload", true),
     };
@@ -1148,6 +1206,25 @@ async fn execute_configured_tool(
 fn configured_result(result: CommandResult, _mode: &str, _mutating: bool) -> CallToolResponse {
     let text = serde_json::to_string_pretty(&result).unwrap_or_else(|error| error.to_string());
     CallToolResult::success(vec![ContentBlock::text(text)]).into()
+}
+
+fn ssh_command_result(result: SshExecutionResult, tool: &ConfiguredTool) -> CommandResult {
+    CommandResult {
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exit_code: result.exit_code,
+        started_at: result.started_at,
+        ended_at: result.ended_at,
+        duration_ms: result.duration_ms,
+        host: format!("{}@{}", tool.ssh_user, tool.ssh_host),
+        mode: "ssh_russh".into(),
+        mutating: true,
+        timed_out: result.timed_out,
+        stdout_truncated: false,
+        stderr_truncated: false,
+        redaction_count: 0,
+        redactions: Vec::new(),
+    }
 }
 
 fn redact_configured_secrets(result: &mut CommandResult, keys: &[String]) {
@@ -1231,7 +1308,16 @@ pub async fn serve_stdio(settings: Settings) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn build_http_app(settings: Settings) -> anyhow::Result<axum::Router> {
+    let server = McpServer::new(settings.clone())?;
+    build_http_app_with_server(settings, server)
+}
+
+fn build_http_app_with_server(
+    settings: Settings,
+    server: McpServer,
+) -> anyhow::Result<axum::Router> {
     let allowed_hosts = [
         settings.host.clone(),
         if settings.host.contains(':') {
@@ -1240,7 +1326,6 @@ fn build_http_app(settings: Settings) -> anyhow::Result<axum::Router> {
             format!("{}:{}", settings.host, settings.port)
         },
     ];
-    let server = McpServer::new(settings.clone())?;
     let service = StreamableHttpService::new(
         move || Ok(server.clone()),
         LocalSessionManager::default().into(),
@@ -1271,9 +1356,13 @@ fn build_http_app(settings: Settings) -> anyhow::Result<axum::Router> {
 
 pub async fn serve_http(settings: Settings) -> anyhow::Result<()> {
     let address = format!("{}:{}", settings.host, settings.port);
-    let app = build_http_app(settings)?;
+    let server = McpServer::new(settings.clone())?;
+    let app = build_http_app_with_server(settings, server.clone())?;
     let listener = tokio::net::TcpListener::bind(&address).await?;
     tracing::info!("Command MCP listening on http://{address}/mcp");
+    if env::var("COMMAND_MCP_CONTROL").ok().as_deref() == Some("1") {
+        tokio::spawn(crate::ssh::control_loop(server));
+    }
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
