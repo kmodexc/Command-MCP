@@ -27,6 +27,17 @@ Start the desktop UI:
 cargo run --bin command-mcp-ui
 ```
 
+On Ubuntu, build the release binaries and install a user application launcher:
+
+```bash
+PATH="$HOME/.cargo/bin:$PATH" ./scripts/install-desktop-entry.sh
+```
+
+This installs `Command MCP` in the desktop application menu. The launcher uses
+an absolute binary path and starts with the home directory as its working
+directory; configuration and secrets remain in the platform application
+directories.
+
 The UI starts and owns the local MCP server process. It shows built-in commands
 in groups with quick enable-all and disable-all controls, alongside configured
 tools in a collapsible tree catalog. New configurations keep all predefined
