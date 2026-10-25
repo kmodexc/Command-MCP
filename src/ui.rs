@@ -30,6 +30,7 @@ struct CommandMcpApp {
     selection: Option<Selection>,
     server: Option<ServerProcess>,
     status: String,
+    error_message: Option<String>,
     env_path: PathBuf,
     env_values: BTreeMap<String, String>,
     reveal_secrets: bool,
@@ -103,6 +104,7 @@ impl CommandMcpApp {
             selection: None,
             server: None,
             status: "Starting the local MCP server…".into(),
+            error_message: None,
             env_path,
             env_values,
             reveal_secrets: false,
@@ -133,6 +135,9 @@ impl CommandMcpApp {
                 }
             )
         };
+        if !startup_errors.is_empty() {
+            app.error_message = Some(app.status.clone());
+        }
         app
     }
 
@@ -144,7 +149,18 @@ impl CommandMcpApp {
     }
 
     fn report_error(&mut self, context: &str, error: impl std::fmt::Display) {
-        self.status = format!("{context}: {error}");
+        self.set_error(format!("{context}: {error}"));
+    }
+
+    fn set_status(&mut self, status: impl Into<String>) {
+        self.status = status.into();
+        self.error_message = None;
+    }
+
+    fn set_error(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        self.status = message.clone();
+        self.error_message = Some(message);
     }
 
     fn enabled_commands(&mut self) -> &mut BTreeSet<String> {
@@ -257,7 +273,7 @@ impl CommandMcpApp {
         match self.persist_changes() {
             Ok(()) => {
                 self.restart_required = true;
-                self.status = "Changes saved. Restart required to apply them.".into();
+                self.set_status("Changes saved. Restart required to apply them.");
             }
             Err(error) => self.report_error("Could not save changes", error),
         }
@@ -293,41 +309,40 @@ impl CommandMcpApp {
         if let Some(server) = self.server.take() {
             server.stop()?;
         }
-        self.status = "Server stopped.".into();
+        self.set_status("Server stopped.");
         Ok(())
     }
 
     fn connect_ssh_password(&mut self, tool: String) {
         if self.restart_required {
-            self.status =
-                "Save the tool and restart the server before opening an SSH session.".into();
+            self.set_error("Save the tool and restart the server before opening an SSH session.");
             return;
         }
         let password = std::mem::take(&mut self.ssh_password_draft);
         if password.is_empty() {
-            self.status = "Enter the SSH password before connecting.".into();
+            self.set_error("Enter the SSH password before connecting.");
             return;
         }
         let Some(server) = self.server.as_mut() else {
-            self.status = "The MCP server is not running.".into();
+            self.set_error("The MCP server is not running.");
             return;
         };
         match server.send_control(command_mcp::ssh::SshControlRequest::Connect {
             tool,
             password: command_mcp::ssh::SensitiveString::new(password),
         }) {
-            Ok(()) => self.status = "SSH access request sent to the server.".into(),
+            Ok(()) => self.set_status("SSH access request sent to the server."),
             Err(error) => self.report_error("Could not request SSH access", error),
         }
     }
 
     fn revoke_ssh_password(&mut self, tool: String) {
         let Some(server) = self.server.as_mut() else {
-            self.status = "The MCP server is not running.".into();
+            self.set_error("The MCP server is not running.");
             return;
         };
         match server.send_control(command_mcp::ssh::SshControlRequest::Revoke { tool }) {
-            Ok(()) => self.status = "SSH access revoked.".into(),
+            Ok(()) => self.set_status("SSH access revoked."),
             Err(error) => self.report_error("Could not revoke SSH access", error),
         }
     }
@@ -350,9 +365,10 @@ impl CommandMcpApp {
         .flatten()
         .collect::<Vec<_>>();
         if !errors.is_empty() {
-            self.status = errors.join("\n");
+            self.set_error(errors.join("\n"));
         } else if !stopped_with_error && !started_with_error {
-            self.status = self.running_status();
+            let status = self.running_status();
+            self.set_status(status);
         }
     }
 
@@ -372,14 +388,14 @@ impl CommandMcpApp {
             self.server.take();
             self.restart_required = true;
             let details = exit.stderr.trim();
-            self.status = if details.is_empty() {
+            self.set_error(if details.is_empty() {
                 format!(
                     "Server exited ({}). Use Restart to launch it again.",
                     exit.status
                 )
             } else {
                 format!("Server exited ({}): {details}", exit.status)
-            };
+            });
         }
     }
 
@@ -392,16 +408,16 @@ impl CommandMcpApp {
         for line in events {
             match serde_json::from_str::<SshControlEvent>(&line) {
                 Ok(SshControlEvent::Connected { tool }) => {
-                    self.status = format!("SSH access granted for tool {tool:?}.");
+                    self.set_status(format!("SSH access granted for tool {tool:?}."));
                 }
                 Ok(SshControlEvent::Revoked { tool }) => {
-                    self.status = format!("SSH access revoked for tool {tool:?}.");
+                    self.set_status(format!("SSH access revoked for tool {tool:?}."));
                 }
                 Ok(SshControlEvent::Error { tool, message }) => {
-                    self.status = match tool {
+                    self.set_error(match tool {
                         Some(tool) => format!("SSH tool {tool:?} failed: {message}"),
                         None => format!("Server control error: {message}"),
-                    };
+                    });
                 }
                 Err(error) => {
                     self.report_error("Could not read a server control event", error);
@@ -480,9 +496,9 @@ impl CommandMcpApp {
                         Ok(values) => {
                             self.env_path = path;
                             self.env_values = values;
-                            self.status =
-                                "Environment file loaded. Save changes, then restart the server."
-                                    .into();
+                            self.set_status(
+                                "Environment file loaded. Save changes, then restart the server.",
+                            );
                             self.restart_required = true;
                         }
                         Err(error) => self.report_error("Could not load environment file", error),
@@ -928,18 +944,61 @@ impl Drop for CommandMcpApp {
     }
 }
 
+impl CommandMcpApp {
+    fn draw_error_banner(&mut self, ui: &mut egui::Ui) {
+        let Some(message) = self.error_message.clone() else {
+            return;
+        };
+
+        let mut dismiss = false;
+        egui::Frame::group(ui.style())
+            .fill(egui::Color32::from_rgb(74, 28, 28))
+            .stroke(egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgb(220, 90, 90),
+            ))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.colored_label(egui::Color32::from_rgb(255, 150, 150), "Error");
+                    if ui.small_button("Copy").clicked() {
+                        ui.ctx().copy_text(message.clone());
+                    }
+                    if ui.small_button("Dismiss").clicked() {
+                        dismiss = true;
+                    }
+                });
+                ui.add(
+                    egui::Label::new(egui::RichText::new(message).color(
+                        egui::Color32::from_rgb(255, 220, 220),
+                    ))
+                    .wrap(),
+                );
+            });
+
+        if dismiss {
+            self.error_message = None;
+            self.status = "Error dismissed.".into();
+        }
+    }
+}
+
 impl eframe::App for CommandMcpApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_server();
         ui.horizontal(|ui| {
             ui.strong("Command MCP");
             ui.separator();
-            ui.label(&self.status);
+            if self.error_message.is_some() {
+                ui.colored_label(egui::Color32::from_rgb(255, 120, 120), "Error");
+            } else {
+                ui.label(&self.status);
+            }
             if self.server.is_none() && ui.button("Start").clicked() {
                 match self.start_server() {
                     Ok(()) => {
                         self.restart_required = false;
-                        self.status = self.running_status();
+                        let status = self.running_status();
+                        self.set_status(status);
                     }
                     Err(error) => self.report_error("Could not start the server", error),
                 }
@@ -966,6 +1025,7 @@ impl eframe::App for CommandMcpApp {
                 }
             }
         });
+        self.draw_error_banner(ui);
         ui.small(format!("Configuration: {}", self.config_path.display()));
         ui.separator();
 
@@ -1250,6 +1310,7 @@ mod tests {
             selection: None,
             server: None,
             status: String::new(),
+            error_message: None,
             env_path,
             env_values: BTreeMap::from([("COMMAND_MCP_API_KEY".into(), "test-key".into())]),
             reveal_secrets: false,
